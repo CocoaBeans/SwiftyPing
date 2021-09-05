@@ -159,6 +159,8 @@ public class SwiftyPing: NSObject {
     public var currentCount: Int {
         return sequenceIndex
     }
+    /// Flag to enable socket processing on a background thread
+    public var runInBackground: Bool = false
 
     /// A random identifier which is a part of the ping request.
     private let identifier = UInt16.random(in: 0..<UInt16.max)
@@ -166,7 +168,10 @@ public class SwiftyPing: NSObject {
     private let fingerprint = UUID()
     /// User-specified dispatch queue. The `observer` is always called from this queue.
     private let currentQueue: DispatchQueue
-    
+
+    /// Detached run loop for handling socket communication off of the main thread
+    private var runLoop: CFRunLoop?
+
     /// Socket for sending and receiving data.
     private var socket: CFSocket?
     /// Socket source
@@ -199,8 +204,7 @@ public class SwiftyPing: NSObject {
         self.currentQueue = queue
                 
         super.init()
-        try createSocket()
-        
+
         #if os(iOS)
         if configuration.handleBackgroundTransitions {
             addAppStateNotifications()
@@ -258,47 +262,72 @@ public class SwiftyPing: NSObject {
         let destination = Destination(host: host, ipv4Address: result)
         try self.init(destination: destination, configuration: configuration, queue: queue)
     }
-    
+
+    private func _createSocket() throws {
+        // Create a socket context...
+        let info = SocketInfo(pinger: self, identifier: identifier)
+        unmanagedSocketInfo = Unmanaged.passRetained(info)
+        var context = CFSocketContext(version: 0, info: unmanagedSocketInfo!.toOpaque(), retain: nil, release: nil, copyDescription: nil)
+
+        // ...and a socket...
+        socket = CFSocketCreate(kCFAllocatorDefault, AF_INET, SOCK_DGRAM, IPPROTO_ICMP, CFSocketCallBackType.dataCallBack.rawValue, { socket, type, address, data, info in
+            // Socket callback closure
+            guard let socket = socket, let info = info, let data = data
+            else { return }
+            let socketInfo = Unmanaged<SocketInfo>.fromOpaque(info).takeUnretainedValue()
+            let ping = socketInfo.pinger
+            if (type as CFSocketCallBackType) == CFSocketCallBackType.dataCallBack {
+                let cfdata = Unmanaged<CFData>.fromOpaque(data).takeUnretainedValue()
+                ping?.socket(socket: socket, didReadData: cfdata as Data)
+            }
+        }, &context)
+
+        // Disable SIGPIPE, see issue #15 on GitHub.
+        let handle = CFSocketGetNative(socket)
+        var value: Int32 = 1
+        let err = setsockopt(handle, SOL_SOCKET, SO_NOSIGPIPE, &value, socklen_t(MemoryLayout.size(ofValue: value)))
+        guard err == 0
+        else {
+            throw PingError.socketOptionsSetError(err: err)
+        }
+
+        // Set TTL
+        if var ttl = configuration.timeToLive {
+            let err = setsockopt(handle, IPPROTO_IP, IP_TTL, &ttl, socklen_t(MemoryLayout.size(ofValue: ttl)))
+            guard err == 0
+            else {
+                throw PingError.socketOptionsSetError(err: err)
+            }
+        }
+
+        // ...and add it to the current run loop.
+        socketSource = CFSocketCreateRunLoopSource(nil, socket, 0)
+        if let runLoop = CFRunLoopGetCurrent(),
+           runLoop != CFRunLoopGetMain() {
+            self.runLoop = runLoop
+            CFRunLoopAddSource(runLoop, socketSource, .commonModes)
+            CFRunLoopRun()
+        }
+        else {
+            CFRunLoopAddSource(CFRunLoopGetMain(), socketSource, .commonModes)
+        }
+    }
+
+    @objc
+    private func createSocketDetached() {
+        try? _createSocket()
+    }
+
     /// Initializes a CFSocket.
     /// - Throws: If setting a socket options flag fails, throws a `PingError.socketOptionsSetError(:)`.
     private func createSocket() throws {
-        try _serial.sync {
-            // Create a socket context...
-            let info = SocketInfo(pinger: self, identifier: identifier)
-            unmanagedSocketInfo = Unmanaged.passRetained(info)
-            var context = CFSocketContext(version: 0, info: unmanagedSocketInfo!.toOpaque(), retain: nil, release: nil, copyDescription: nil)
-
-            // ...and a socket...
-            socket = CFSocketCreate(kCFAllocatorDefault, AF_INET, SOCK_DGRAM, IPPROTO_ICMP, CFSocketCallBackType.dataCallBack.rawValue, { socket, type, address, data, info in
-                // Socket callback closure
-                guard let socket = socket, let info = info, let data = data else { return }
-                let socketInfo = Unmanaged<SocketInfo>.fromOpaque(info).takeUnretainedValue()
-                let ping = socketInfo.pinger
-                if (type as CFSocketCallBackType) == CFSocketCallBackType.dataCallBack {
-                    let cfdata = Unmanaged<CFData>.fromOpaque(data).takeUnretainedValue()
-                    ping?.socket(socket: socket, didReadData: cfdata as Data)
-                }
-            }, &context)
-            
-            // Disable SIGPIPE, see issue #15 on GitHub.
-            let handle = CFSocketGetNative(socket)
-            var value: Int32 = 1
-            let err = setsockopt(handle, SOL_SOCKET, SO_NOSIGPIPE, &value, socklen_t(MemoryLayout.size(ofValue: value)))
-            guard err == 0 else {
-                throw PingError.socketOptionsSetError(err: err)
+        if runInBackground {
+            Thread.detachNewThreadSelector(#selector(createSocketDetached), toTarget: self, with: nil)
+        }
+        else {
+            try _serial.sync {
+                try _createSocket()
             }
-            
-            // Set TTL
-            if var ttl = configuration.timeToLive {
-                let err = setsockopt(handle, IPPROTO_IP, IP_TTL, &ttl, socklen_t(MemoryLayout.size(ofValue: ttl)))
-                guard err == 0 else {
-                    throw PingError.socketOptionsSetError(err: err)
-                }
-            }
-            
-            // ...and add it to the main run loop.
-            socketSource = CFSocketCreateRunLoopSource(nil, socket, 0)
-            CFRunLoopAddSource(CFRunLoopGetMain(), socketSource, .commonModes)
         }
     }
 
@@ -311,6 +340,10 @@ public class SwiftyPing: NSObject {
         if socket != nil {
             CFSocketInvalidate(socket)
             socket = nil
+        }
+        if runLoop != nil {
+            CFRunLoopStop(runLoop)
+            runLoop = nil
         }
         unmanagedSocketInfo?.release()
         unmanagedSocketInfo = nil
@@ -425,7 +458,7 @@ public class SwiftyPing: NSObject {
                                     error: error,
                                     byteCount: nil,
                                     ipHeader: nil)
-        
+
         erroredIndices.append(sequenceIndex)
         self.isPinging = false
         informObserver(of: response)
@@ -501,6 +534,7 @@ public class SwiftyPing: NSObject {
             erroredIndices.removeAll()
             sequenceStart = nil
         }
+        tearDown()
     }
     /// Stops pinging the host and destroys the CFSocket object.
     /// - Parameter resetSequence: Controls whether the sequence index should be set back to zero.
@@ -533,7 +567,7 @@ public class SwiftyPing: NSObject {
         } catch {
             print("Unhandled error thrown: \(error)")
         }
-        
+
         timeoutTimer?.invalidate()
         var ipHeader: IPHeader? = nil
         if validationError == nil {
@@ -548,7 +582,7 @@ public class SwiftyPing: NSObject {
                                     ipHeader: ipHeader)
         isPinging = false
         informObserver(of: response)
-        
+
         incrementSequenceIndex()
         scheduleNextPing()
     }
